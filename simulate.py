@@ -47,6 +47,32 @@ async def receiver_loop(ws, state: dict):
                 print(f"\nAI: {content}")
             continue
 
+        if msg_type == "bot_message_stream":
+            if data.get("user_id") != state["user_id"]:
+                continue
+
+            chat_id = data.get("chat_id", "")
+            stream_id = data.get("stream_id") or data.get("message_id")
+            stream_state = str(data.get("state", "")).lower()
+            content = data.get("content", "")
+            if not stream_id:
+                continue
+
+            stream_key = f"{chat_id}::{stream_id}"
+            streams = state.setdefault("streaming_outputs", {})
+
+            if stream_state == "delta":
+                streams[stream_key] = content
+                prefix = f"AI[{chat_id}]" if chat_id and chat_id != state["active_chat_id"] else "AI"
+                print(f"\r{prefix}: {content}", end="", flush=True)
+                continue
+
+            if stream_state == "final":
+                streams.pop(stream_key, None)
+                prefix = f"AI[{chat_id}]" if chat_id and chat_id != state["active_chat_id"] else "AI"
+                print(f"\r{prefix}: {content}")
+                continue
+
         if msg_type == "error":
             print(f"\nSystem Error: {data.get('error', 'unknown error')}")
 
@@ -59,6 +85,7 @@ async def simulate():
         "active_chat_id": "default_chat",
         "last_processed_msg_id": None,
         "new_conversation_event": None,
+        "streaming_outputs": {},
     }
     
     while True:

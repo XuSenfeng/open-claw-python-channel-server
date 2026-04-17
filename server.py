@@ -53,7 +53,129 @@ class VirtualPlatformServer:
         self.users: Dict[str, VirtualPlatformUser] = {}
         self.connected_plugins: Set[WebSocketServerProtocol] = set()
         self.message_handlers: List[Callable] = []
+        self.stream_buffers: Dict[str, Dict[str, Any]] = {}
         self._init_demo_users()
+
+    @staticmethod
+    def _stream_key(user_id: str, chat_id: str, stream_id: str) -> str:
+        return f"{user_id}::{chat_id}::{stream_id}"
+
+    def _resolve_stream_state(self, message: Dict[str, Any]) -> Optional[str]:
+        state = message.get("stream_state")
+        if isinstance(state, str):
+            normalized = state.strip().lower()
+            if normalized in {"delta", "final"}:
+                return normalized
+
+        if bool(message.get("stream")):
+            if bool(message.get("stream_done")):
+                return "final"
+            return "delta"
+
+        return None
+
+    def _resolve_stream_id(self, message: Dict[str, Any]) -> Optional[str]:
+        candidates = [
+            message.get("stream_id"),
+            message.get("response_id"),
+            message.get("run_id"),
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return None
+
+    async def _handle_streamed_send_message(
+        self,
+        *,
+        message: Dict[str, Any],
+        websocket: WebSocketServerProtocol,
+        user_id: str,
+        chat_id: str,
+        content: str,
+        stream_id: str,
+        stream_state: str,
+    ):
+        stream_key = self._stream_key(user_id, chat_id, stream_id)
+        stream_entry = self.stream_buffers.get(stream_key)
+        if stream_entry is None:
+            stream_entry = {
+                "content": "",
+                "client_message_id": message.get("client_message_id"),
+            }
+            self.stream_buffers[stream_key] = stream_entry
+
+        if stream_state == "delta":
+            stream_entry["content"] = f"{stream_entry['content']}{content}"
+
+            await self.broadcast_to_plugins(
+                {
+                    "type": "bot_message_stream",
+                    "state": "delta",
+                    "user_id": user_id,
+                    "user_name": self.users[user_id].name,
+                    "chat_id": chat_id,
+                    "stream_id": stream_id,
+                    "message_id": stream_id,
+                    "client_message_id": stream_entry.get("client_message_id"),
+                    "delta": content,
+                    "content": stream_entry["content"],
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+
+            response = {
+                "type": "send_message_response",
+                "status": "streaming",
+                "stream_id": stream_id,
+                "stream_state": "delta",
+                "timestamp": datetime.now().isoformat(),
+            }
+            await websocket.send(json.dumps(response))
+            return
+
+        final_is_full_content = bool(message.get("stream_full_content"))
+        final_content = content if final_is_full_content else f"{stream_entry['content']}{content}"
+        final_message_id = stream_id or str(uuid.uuid4())
+
+        chat = self.users[user_id].get_or_create_chat(chat_id)
+        msg_record = {
+            "id": final_message_id,
+            "from": "bot",
+            "content": final_content,
+            "timestamp": datetime.now().isoformat(),
+        }
+        client_message_id = stream_entry.get("client_message_id")
+        if isinstance(client_message_id, str) and client_message_id.strip():
+            msg_record["client_message_id"] = client_message_id.strip()
+        chat.append(msg_record)
+
+        await self.broadcast_to_plugins(
+            {
+                "type": "bot_message_stream",
+                "state": "final",
+                "user_id": user_id,
+                "user_name": self.users[user_id].name,
+                "chat_id": chat_id,
+                "stream_id": stream_id,
+                "message_id": final_message_id,
+                "client_message_id": msg_record.get("client_message_id"),
+                "content": final_content,
+                "timestamp": msg_record["timestamp"],
+            }
+        )
+
+        self.stream_buffers.pop(stream_key, None)
+
+        response = {
+            "type": "send_message_response",
+            "message_id": final_message_id,
+            "status": "success",
+            "stream_id": stream_id,
+            "stream_state": "final",
+            "timestamp": datetime.now().isoformat(),
+        }
+        await websocket.send(json.dumps(response))
 
     def _init_demo_users(self):
         """初始化演示用户"""
@@ -167,6 +289,20 @@ class VirtualPlatformServer:
 
         # 保存消息
         if user_id in self.users:
+            stream_state = self._resolve_stream_state(message)
+            stream_id = self._resolve_stream_id(message)
+            if stream_state is not None and stream_id is not None:
+                await self._handle_streamed_send_message(
+                    message=message,
+                    websocket=websocket,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    content=str(content),
+                    stream_id=stream_id,
+                    stream_state=stream_state,
+                )
+                return
+
             chat = self.users[user_id].get_or_create_chat(chat_id)
             client_message_id = message.get("client_message_id")
             msg_record = {

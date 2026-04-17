@@ -168,12 +168,15 @@ class VirtualPlatformServer:
         # 保存消息
         if user_id in self.users:
             chat = self.users[user_id].get_or_create_chat(chat_id)
+            client_message_id = message.get("client_message_id")
             msg_record = {
                 "id": str(uuid.uuid4()),
                 "from": "bot",
                 "content": content,
                 "timestamp": datetime.now().isoformat(),
             }
+            if isinstance(client_message_id, str) and client_message_id.strip():
+                msg_record["client_message_id"] = client_message_id.strip()
             chat.append(msg_record)
 
             logger.info(f"Bot replied to {user_id} in chat {chat_id}: {content}")
@@ -186,6 +189,7 @@ class VirtualPlatformServer:
                     "user_name": self.users[user_id].name,
                     "chat_id": chat_id,
                     "message_id": msg_record["id"],
+                    "client_message_id": msg_record.get("client_message_id"),
                     "content": content,
                     "from": "bot",
                     "timestamp": msg_record["timestamp"],
@@ -218,6 +222,7 @@ class VirtualPlatformServer:
             chat = self.users[user_id].get_or_create_chat(chat_id)
             response = {
                 "type": "get_messages_response",
+                "chat_id": chat_id,
                 "messages": chat,
                 "user_name": self.users[user_id].name,
             }
@@ -273,6 +278,9 @@ class VirtualPlatformServer:
             "content": content,
             "timestamp": datetime.now().isoformat(),
         }
+        client_message_id = message.get("client_message_id")
+        if isinstance(client_message_id, str) and client_message_id.strip():
+            msg_record["client_message_id"] = client_message_id.strip()
         chat.append(msg_record)
 
         logger.info(f"User {user_id} ({user.name}) sent in {chat_id}: {content}")
@@ -284,6 +292,7 @@ class VirtualPlatformServer:
             "user_name": user.name,
             "chat_id": chat_id,
             "message_id": msg_record["id"],
+            "client_message_id": msg_record.get("client_message_id"),
             "content": content,
             "timestamp": msg_record["timestamp"],
         }

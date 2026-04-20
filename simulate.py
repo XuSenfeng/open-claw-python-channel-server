@@ -18,6 +18,17 @@ async def receiver_loop(ws, state: dict):
         data = json.loads(raw)
         msg_type = data.get("type")
 
+        if msg_type == "register_response":
+            state["registered"] = data.get("status") == "success"
+            state["paired"] = bool(data.get("paired"))
+            event = state.get("register_event")
+            if event is not None and not event.is_set():
+                event.set()
+            print(
+                f"\nSystem: Registered role=client server_id={state['server_id']} paired={state['paired']}"
+            )
+            continue
+
         if msg_type in ["start_new_conversation", "start_new_conversation_response"]:
             chat_id = data.get("chat_id")
             if chat_id:
@@ -79,12 +90,17 @@ async def receiver_loop(ws, state: dict):
 
 async def simulate():
     uri = os.getenv("PYTHON_PLATFORM_WS_URL", "ws://192.168.0.8:8765")
-    user_id = "user001"
+    server_id = os.getenv("PYTHON_PLATFORM_SERVER_ID", "default")
+    user_id = os.getenv("PYTHON_PLATFORM_USER_ID", "user001")
     state = {
         "user_id": user_id,
+        "server_id": server_id,
         "active_chat_id": "default_chat",
         "last_processed_msg_id": None,
         "new_conversation_event": None,
+        "register_event": None,
+        "registered": False,
+        "paired": False,
         "streaming_outputs": {},
     }
     
@@ -93,8 +109,28 @@ async def simulate():
             async with websockets.connect(uri) as ws:
                 print("\n✅ Connected to Virtual Platform. Type 'exit' to quit.")
                 print("💡 Type '/new' to start a new conversation.")
+                print(f"🔐 Pair target server_id={server_id}, user_id={user_id}")
 
                 receiver_task = asyncio.create_task(receiver_loop(ws, state))
+
+                register_event = asyncio.Event()
+                state["register_event"] = register_event
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "register",
+                            "role": "client",
+                            "server_id": server_id,
+                            "user_id": user_id,
+                        }
+                    )
+                )
+                try:
+                    await asyncio.wait_for(register_event.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    print("System: register timeout, retry later.")
+                finally:
+                    state["register_event"] = None
                 
                 while True:
                     user_input_raw = await ainput(f"You[{state['active_chat_id']}]: ")
@@ -109,6 +145,9 @@ async def simulate():
                         return
 
                     if user_input.lower() == "/new":
+                        if not state["paired"]:
+                            print("System: current client is not paired with any OpenClaw on same server_id")
+                            continue
                         event = asyncio.Event()
                         state["new_conversation_event"] = event
                         req = {"type": "start_new_conversation", "user_id": user_id}
@@ -123,6 +162,10 @@ async def simulate():
                         continue
                         
                     if not user_input:
+                        continue
+
+                    if not state["paired"]:
+                        print("System: no matched OpenClaw for this server_id/user_id, message blocked")
                         continue
 
                     msg = {

@@ -9,7 +9,7 @@ import json
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -51,14 +51,16 @@ class VirtualPlatformServer:
         self.host = host
         self.port = port
         self.users: Dict[str, VirtualPlatformUser] = {}
-        self.connected_plugins: Set[WebSocketServerProtocol] = set()
+        self.openclaw_connections_by_server: Dict[str, Set[WebSocketServerProtocol]] = {}
+        self.client_connections_by_server_user: Dict[Tuple[str, str], Set[WebSocketServerProtocol]] = {}
+        self.connection_meta: Dict[WebSocketServerProtocol, Dict[str, str]] = {}
         self.message_handlers: List[Callable] = []
         self.stream_buffers: Dict[str, Dict[str, Any]] = {}
         self._init_demo_users()
 
     @staticmethod
-    def _stream_key(user_id: str, chat_id: str, stream_id: str) -> str:
-        return f"{user_id}::{chat_id}::{stream_id}"
+    def _stream_key(server_id: str, user_id: str, chat_id: str, stream_id: str) -> str:
+        return f"{server_id}::{user_id}::{chat_id}::{stream_id}"
 
     def _resolve_stream_state(self, message: Dict[str, Any]) -> Optional[str]:
         state = message.get("stream_state")
@@ -90,13 +92,14 @@ class VirtualPlatformServer:
         *,
         message: Dict[str, Any],
         websocket: WebSocketServerProtocol,
+        server_id: str,
         user_id: str,
         chat_id: str,
         content: str,
         stream_id: str,
         stream_state: str,
     ):
-        stream_key = self._stream_key(user_id, chat_id, stream_id)
+        stream_key = self._stream_key(server_id, user_id, chat_id, stream_id)
         stream_entry = self.stream_buffers.get(stream_key)
         if stream_entry is None:
             stream_entry = {
@@ -108,9 +111,12 @@ class VirtualPlatformServer:
         if stream_state == "delta":
             stream_entry["content"] = f"{stream_entry['content']}{content}"
 
-            await self.broadcast_to_plugins(
+            await self._send_to_clients(
+                server_id,
+                user_id,
                 {
                     "type": "bot_message_stream",
+                    "server_id": server_id,
                     "state": "delta",
                     "user_id": user_id,
                     "user_name": self.users[user_id].name,
@@ -150,9 +156,12 @@ class VirtualPlatformServer:
             msg_record["client_message_id"] = client_message_id.strip()
         chat.append(msg_record)
 
-        await self.broadcast_to_plugins(
+        await self._send_to_clients(
+            server_id,
+            user_id,
             {
                 "type": "bot_message_stream",
+                "server_id": server_id,
                 "state": "final",
                 "user_id": user_id,
                 "user_name": self.users[user_id].name,
@@ -187,36 +196,208 @@ class VirtualPlatformServer:
         """注册消息处理器"""
         self.message_handlers.append(handler)
 
-    async def broadcast_to_plugins(self, message: Dict[str, Any]):
-        """广播消息到所有已连接的插件"""
-        if not self.connected_plugins:
-            logger.warning("No plugins connected to broadcast message")
+    @staticmethod
+    def _normalize_identity(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        return value.strip()
+
+    def _get_connection_meta(self, websocket: WebSocketServerProtocol) -> Dict[str, str]:
+        return self.connection_meta.get(websocket, {})
+
+    def _remove_connection_from_registries(self, websocket: WebSocketServerProtocol):
+        meta = self.connection_meta.pop(websocket, None)
+        if not meta:
             return
 
-        logger.info(f"Broadcasting to {len(self.connected_plugins)} plugins: {message}")
+        role = meta.get("role")
+        server_id = meta.get("server_id")
+        user_id = meta.get("user_id")
+
+        if role == "openclaw" and server_id:
+            targets = self.openclaw_connections_by_server.get(server_id)
+            if targets:
+                targets.discard(websocket)
+                if not targets:
+                    self.openclaw_connections_by_server.pop(server_id, None)
+
+        if role == "client" and server_id and user_id:
+            key = (server_id, user_id)
+            targets = self.client_connections_by_server_user.get(key)
+            if targets:
+                targets.discard(websocket)
+                if not targets:
+                    self.client_connections_by_server_user.pop(key, None)
+
+    def _register_connection(self, websocket: WebSocketServerProtocol, meta: Dict[str, str]):
+        self._remove_connection_from_registries(websocket)
+        self.connection_meta[websocket] = meta
+
+        role = meta.get("role", "")
+        server_id = meta.get("server_id", "")
+        user_id = meta.get("user_id", "")
+
+        if role == "openclaw":
+            targets = self.openclaw_connections_by_server.setdefault(server_id, set())
+            targets.add(websocket)
+            return
+
+        if role == "client":
+            key = (server_id, user_id)
+            targets = self.client_connections_by_server_user.setdefault(key, set())
+            targets.add(websocket)
+
+    def _has_pair(self, server_id: str, user_id: str) -> bool:
+        has_openclaw = bool(self.openclaw_connections_by_server.get(server_id))
+        has_client = bool(self.client_connections_by_server_user.get((server_id, user_id)))
+        return has_openclaw and has_client
+
+    async def _send_to_targets(
+        self, targets: Set[WebSocketServerProtocol], message: Dict[str, Any]
+    ) -> int:
+        if not targets:
+            return 0
+
         disconnected = set()
-
-        for plugin_ws in self.connected_plugins:
+        delivered = 0
+        for ws in targets:
             try:
-                await plugin_ws.send(json.dumps(message))
+                await ws.send(json.dumps(message))
+                delivered += 1
             except Exception as e:
-                logger.error(f"Failed to send to plugin: {e}")
-                disconnected.add(plugin_ws)
+                logger.error(f"Failed to send message: {e}")
+                disconnected.add(ws)
 
-        self.connected_plugins -= disconnected
+        for ws in disconnected:
+            self._remove_connection_from_registries(ws)
+
+        return delivered
+
+    async def _send_to_openclaw(self, server_id: str, message: Dict[str, Any]) -> int:
+        targets = self.openclaw_connections_by_server.get(server_id, set()).copy()
+        return await self._send_to_targets(targets, message)
+
+    async def _send_to_clients(self, server_id: str, user_id: str, message: Dict[str, Any]) -> int:
+        targets = self.client_connections_by_server_user.get((server_id, user_id), set()).copy()
+        return await self._send_to_targets(targets, message)
+
+    async def _handle_register_message(
+        self, message: Dict[str, Any], websocket: WebSocketServerProtocol, connection_id: str
+    ):
+        role = self._normalize_identity(message.get("role")).lower()
+        server_id = self._normalize_identity(message.get("server_id"))
+        user_id = self._normalize_identity(message.get("user_id"))
+        user_name = self._normalize_identity(message.get("user_name"))
+
+        if role not in {"openclaw", "client"}:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": "Invalid role. Allowed: openclaw, client",
+                    }
+                )
+            )
+            return
+
+        if not server_id:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": "Missing required field: server_id",
+                    }
+                )
+            )
+            return
+
+        if role == "client" and not user_id:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": "Missing required field: user_id for client role",
+                    }
+                )
+            )
+            return
+
+        if role == "client" and user_id not in self.users:
+            display_name = user_name or user_id
+            self.users[user_id] = VirtualPlatformUser(user_id, display_name)
+
+        meta = {
+            "connection_id": connection_id,
+            "role": role,
+            "server_id": server_id,
+            "user_id": user_id if role == "client" else "",
+        }
+        self._register_connection(websocket, meta)
+
+        paired = False
+        if role == "openclaw":
+            paired = any(
+                self._has_pair(server_id, candidate_user_id)
+                for _, candidate_user_id in self.client_connections_by_server_user.keys()
+                if _ == server_id
+            )
+        else:
+            paired = self._has_pair(server_id, user_id)
+
+        response = {
+            "type": "register_response",
+            "status": "success",
+            "role": role,
+            "server_id": server_id,
+            "user_id": user_id if role == "client" else None,
+            "paired": paired,
+            "timestamp": datetime.now().isoformat(),
+        }
+        await websocket.send(json.dumps(response))
+
+    async def _require_registered(
+        self,
+        websocket: WebSocketServerProtocol,
+        *,
+        allowed_roles: Optional[Set[str]] = None,
+    ) -> Optional[Dict[str, str]]:
+        meta = self._get_connection_meta(websocket)
+        if not meta:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": "Connection is not registered. Send type=register first.",
+                    }
+                )
+            )
+            return None
+
+        if allowed_roles and meta.get("role") not in allowed_roles:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": f"Role {meta.get('role')} is not allowed for this operation",
+                    }
+                )
+            )
+            return None
+
+        return meta
 
     async def handle_plugin_connection(self, websocket: WebSocketServerProtocol):
         """处理插件连接"""
-        plugin_id = str(uuid.uuid4())[:8]
-        self.connected_plugins.add(websocket)
-        logger.info(f"Plugin connected: {plugin_id}")
+        connection_id = str(uuid.uuid4())[:8]
+        logger.info(f"Connection accepted: {connection_id}")
 
         try:
             # 发送欢迎消息
             welcome = {
                 "type": "connect",
                 "platform_id": "python-virtual-platform",
-                "plugin_id": plugin_id,
+                "connection_id": connection_id,
+                "register_required": True,
                 "timestamp": datetime.now().isoformat(),
                 "features": ["messages", "reactions", "typing"],
             }
@@ -225,32 +406,41 @@ class VirtualPlatformServer:
             async for message_raw in websocket:
                 try:
                     message = json.loads(message_raw)
-                    # 只有 simulate_user_message 是来自模拟器，其他可能来自插件自身
-                    if message.get("type") == "simulate_user_message":
+                    msg_type = message.get("type")
+                    if msg_type == "register":
+                        await self._handle_register_message(message, websocket, connection_id)
+                        continue
+
+                    if msg_type == "simulate_user_message":
                         logger.info(f"Received simulate_user_message from {message.get('user_id')}")
-                    await self.handle_plugin_message(message, plugin_id, websocket)
+
+                    await self.handle_plugin_message(message, connection_id, websocket)
                 except json.JSONDecodeError:
                     logger.error(f"Invalid JSON from plugin: {message_raw}")
                 except Exception as e:
                     logger.error(f"Error processing plugin message: {e}")
 
         except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Plugin disconnected: {plugin_id}")
+            logger.info(f"Connection disconnected: {connection_id}")
         finally:
-            self.connected_plugins.discard(websocket)
+            self._remove_connection_from_registries(websocket)
 
     async def handle_plugin_message(
-        self, message: Dict[str, Any], plugin_id: str, websocket: WebSocketServerProtocol
+        self, message: Dict[str, Any], connection_id: str, websocket: WebSocketServerProtocol
     ):
         """处理来自插件的消息"""
         msg_type = message.get("type")
-        logger.info(f"Plugin {plugin_id} sent: {msg_type}")
+        logger.info(f"Connection {connection_id} sent: {msg_type}")
 
         if msg_type == "send_message":
+            if not await self._require_registered(websocket, allowed_roles={"openclaw"}):
+                return
             # 插件发送消息给用户
             await self._handle_send_message(message, websocket)
 
         elif msg_type == "get_messages":
+            if not await self._require_registered(websocket):
+                return
             # 插件查询消息历史
             await self._handle_get_messages(message, websocket)
 
@@ -260,11 +450,15 @@ class VirtualPlatformServer:
             await websocket.send(json.dumps(response))
 
         elif msg_type == "simulate_user_message":
+            if not await self._require_registered(websocket, allowed_roles={"client"}):
+                return
             # 模拟用户发送消息
             logger.info(f"Handling simulate_user_message for user: {message.get('user_id')}")
-            await self._handle_simulate_message(message)
+            await self._handle_simulate_message(message, websocket)
 
         elif msg_type == "start_new_conversation":
+            if not await self._require_registered(websocket, allowed_roles={"client"}):
+                return
             # 显式开启新会话
             await self._handle_start_new_conversation(message, websocket)
 
@@ -278,11 +472,21 @@ class VirtualPlatformServer:
         chat_id = message.get("chat_id")
         user_id = message.get("to_user_id")
         content = message.get("content")
+        sender_meta = self._get_connection_meta(websocket)
+        server_id = self._normalize_identity(message.get("server_id")) or sender_meta.get("server_id", "")
 
-        if not all([chat_id, user_id, content]):
+        if not all([chat_id, user_id, content, server_id]):
             response = {
                 "type": "error",
-                "error": "Missing required fields: chat_id, to_user_id, content",
+                "error": "Missing required fields: chat_id, to_user_id, content, server_id",
+            }
+            await websocket.send(json.dumps(response))
+            return
+
+        if not self._has_pair(server_id, user_id):
+            response = {
+                "type": "error",
+                "error": f"No matched client/openclaw pair for server_id={server_id}, user_id={user_id}",
             }
             await websocket.send(json.dumps(response))
             return
@@ -300,6 +504,7 @@ class VirtualPlatformServer:
                     content=str(content),
                     stream_id=stream_id,
                     stream_state=stream_state,
+                    server_id=server_id,
                 )
                 return
 
@@ -318,9 +523,12 @@ class VirtualPlatformServer:
             logger.info(f"Bot replied to {user_id} in chat {chat_id}: {content}")
 
             # 主动推送机器人回复，客户端可实时显示，无需轮询 get_messages
-            await self.broadcast_to_plugins(
+            delivered = await self._send_to_clients(
+                server_id,
+                user_id,
                 {
                     "type": "bot_message",
+                    "server_id": server_id,
                     "user_id": user_id,
                     "user_name": self.users[user_id].name,
                     "chat_id": chat_id,
@@ -331,6 +539,11 @@ class VirtualPlatformServer:
                     "timestamp": msg_record["timestamp"],
                 }
             )
+
+            if delivered == 0:
+                logger.warning(
+                    f"No client online for bot_message routing: server_id={server_id}, user_id={user_id}"
+                )
 
             # 返回成功响应
             response = {
@@ -367,8 +580,13 @@ class VirtualPlatformServer:
             response = {"type": "error", "error": f"User {user_id} not found"}
             await websocket.send(json.dumps(response))
 
-    async def _handle_simulate_message(self, message: Dict[str, Any]):
+    async def _handle_simulate_message(
+        self, message: Dict[str, Any], websocket: WebSocketServerProtocol
+    ):
         """模拟用户发送消息"""
+        registered_meta = self._get_connection_meta(websocket)
+        server_id = registered_meta.get("server_id", "")
+        registered_user_id = registered_meta.get("user_id", "")
         user_id = message.get("user_id")
         content = message.get("content")
         requested_chat_id = message.get("chat_id")
@@ -378,8 +596,30 @@ class VirtualPlatformServer:
             logger.error("Missing user_id or content in simulate_user_message")
             return
 
+        if user_id != registered_user_id:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": "user_id in message must match registered user_id",
+                    }
+                )
+            )
+            return
+
         if user_id not in self.users:
             logger.error(f"User {user_id} not found")
+            return
+
+        if not self._has_pair(server_id, user_id):
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": f"No matched client/openclaw pair for server_id={server_id}, user_id={user_id}",
+                    }
+                )
+            )
             return
 
         user = self.users[user_id]
@@ -390,9 +630,11 @@ class VirtualPlatformServer:
                 if isinstance(requested_chat_id, str) and requested_chat_id.strip()
                 else None
             )
-            await self.broadcast_to_plugins(
+            await self._send_to_openclaw(
+                server_id,
                 {
                     "type": "start_new_conversation",
+                    "server_id": server_id,
                     "user_id": user_id,
                     "chat_id": chat_id,
                     "timestamp": datetime.now().isoformat(),
@@ -424,6 +666,7 @@ class VirtualPlatformServer:
         # 广播给插件处理
         event = {
             "type": "inbound_message",
+            "server_id": server_id,
             "user_id": user_id,
             "user_name": user.name,
             "chat_id": chat_id,
@@ -433,12 +676,24 @@ class VirtualPlatformServer:
             "timestamp": msg_record["timestamp"],
         }
 
-        await self.broadcast_to_plugins(event)
+        delivered = await self._send_to_openclaw(server_id, event)
+        if delivered == 0:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": f"No OpenClaw connection registered for server_id={server_id}",
+                    }
+                )
+            )
 
     async def _handle_start_new_conversation(
         self, message: Dict[str, Any], websocket: WebSocketServerProtocol
     ):
         """处理显式新会话请求"""
+        registered_meta = self._get_connection_meta(websocket)
+        server_id = registered_meta.get("server_id", "")
+        registered_user_id = registered_meta.get("user_id", "")
         user_id = message.get("user_id")
         requested_chat_id = message.get("chat_id")
 
@@ -452,6 +707,22 @@ class VirtualPlatformServer:
             await websocket.send(json.dumps(response))
             return
 
+        if user_id != registered_user_id:
+            response = {
+                "type": "error",
+                "error": "user_id in message must match registered user_id",
+            }
+            await websocket.send(json.dumps(response))
+            return
+
+        if not self._has_pair(server_id, user_id):
+            response = {
+                "type": "error",
+                "error": f"No matched client/openclaw pair for server_id={server_id}, user_id={user_id}",
+            }
+            await websocket.send(json.dumps(response))
+            return
+
         user = self.users[user_id]
         chat_id = user.start_new_conversation(
             requested_chat_id
@@ -459,9 +730,11 @@ class VirtualPlatformServer:
             else None
         )
 
-        await self.broadcast_to_plugins(
+        await self._send_to_openclaw(
+            server_id,
             {
                 "type": "start_new_conversation",
+                "server_id": server_id,
                 "user_id": user_id,
                 "chat_id": chat_id,
                 "timestamp": datetime.now().isoformat(),
@@ -470,6 +743,7 @@ class VirtualPlatformServer:
 
         response = {
             "type": "start_new_conversation_response",
+            "server_id": server_id,
             "user_id": user_id,
             "chat_id": chat_id,
             "status": "success",

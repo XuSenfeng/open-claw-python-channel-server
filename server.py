@@ -7,8 +7,10 @@ Python Virtual Platform Server - 虚拟消息平台
 import asyncio
 import json
 import logging
+import secrets
+import string
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import websockets
@@ -56,7 +58,76 @@ class VirtualPlatformServer:
         self.connection_meta: Dict[WebSocketServerProtocol, Dict[str, str]] = {}
         self.message_handlers: List[Callable] = []
         self.stream_buffers: Dict[str, Dict[str, Any]] = {}
+        self.pair_codes: Dict[str, Dict[str, Any]] = {}
+        self.pair_tokens: Dict[str, Dict[str, str]] = {}
         self._init_demo_users()
+
+    @staticmethod
+    def _utc_now() -> datetime:
+        return datetime.utcnow()
+
+    @staticmethod
+    def _generate_pair_code() -> str:
+        return "".join(secrets.choice(string.digits) for _ in range(6))
+
+    def _purge_expired_pair_codes(self):
+        now = self._utc_now()
+        expired_codes = [
+            code for code, meta in self.pair_codes.items() if meta.get("expires_at", now) <= now
+        ]
+        for code in expired_codes:
+            self.pair_codes.pop(code, None)
+
+    def _create_pair_code(self, server_id: str, ttl_seconds: int = 120) -> Dict[str, Any]:
+        self._purge_expired_pair_codes()
+        expires_at = self._utc_now() + timedelta(seconds=max(30, min(ttl_seconds, 600)))
+        for _ in range(10):
+            code = self._generate_pair_code()
+            if code in self.pair_codes:
+                continue
+            self.pair_codes[code] = {
+                "server_id": server_id,
+                "expires_at": expires_at,
+            }
+            return {
+                "pair_code": code,
+                "server_id": server_id,
+                "expires_at": expires_at.isoformat(),
+            }
+
+        raise RuntimeError("Failed to allocate pair code")
+
+    def _resolve_ws_url(self, websocket: WebSocketServerProtocol) -> str:
+        """Resolve external ws URL from connection metadata across websockets versions."""
+        headers: Optional[Any] = getattr(websocket, "request_headers", None)
+
+        if headers is None:
+            request = getattr(websocket, "request", None)
+            if request is not None:
+                headers = getattr(request, "headers", None)
+
+        host = ""
+        proto = "ws"
+        if headers is not None:
+            try:
+                host = str(headers.get("Host", "") or headers.get("host", "")).strip()
+                forwarded_proto = str(
+                    headers.get("X-Forwarded-Proto", "")
+                    or headers.get("x-forwarded-proto", "")
+                ).strip()
+                if forwarded_proto in {"ws", "wss"}:
+                    proto = forwarded_proto
+            except Exception:
+                host = ""
+
+        if host:
+            return f"{proto}://{host}"
+
+        local_address = getattr(websocket, "local_address", None)
+        if isinstance(local_address, tuple) and len(local_address) >= 2:
+            return f"ws://{local_address[0]}:{local_address[1]}"
+
+        return f"ws://{self.host}:{self.port}"
 
     @staticmethod
     def _stream_key(server_id: str, user_id: str, chat_id: str, stream_id: str) -> str:
@@ -287,6 +358,9 @@ class VirtualPlatformServer:
         role = self._normalize_identity(message.get("role")).lower()
         server_id = self._normalize_identity(message.get("server_id"))
         user_id = self._normalize_identity(message.get("user_id"))
+        account_id = self._normalize_identity(message.get("account_id"))
+        pair_token = self._normalize_identity(message.get("pair_token"))
+        device_id = self._normalize_identity(message.get("device_id"))
         user_name = self._normalize_identity(message.get("user_name"))
 
         if role not in {"openclaw", "client"}:
@@ -312,11 +386,52 @@ class VirtualPlatformServer:
             return
 
         if role == "client" and not user_id:
+            user_id = account_id
+
+        if role == "client" and pair_token:
+            token_meta = self.pair_tokens.get(pair_token)
+            if not token_meta:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "error": "Invalid pair_token",
+                        }
+                    )
+                )
+                return
+
+            expected_server = token_meta.get("server_id", "")
+            expected_account = token_meta.get("account_id", "")
+            expected_device = token_meta.get("device_id", "")
+            if expected_server != server_id or expected_account != user_id:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "error": "pair_token does not match server_id/account_id",
+                        }
+                    )
+                )
+                return
+
+            if expected_device and device_id and expected_device != device_id:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "error": "pair_token does not match device_id",
+                        }
+                    )
+                )
+                return
+
+        if role == "client" and not user_id:
             await websocket.send(
                 json.dumps(
                     {
                         "type": "error",
-                        "error": "Missing required field: user_id for client role",
+                        "error": "Missing required field: user_id/account_id for client role",
                     }
                 )
             )
@@ -350,7 +465,116 @@ class VirtualPlatformServer:
             "role": role,
             "server_id": server_id,
             "user_id": user_id if role == "client" else None,
+            "account_id": user_id if role == "client" else None,
             "paired": paired,
+            "timestamp": datetime.now().isoformat(),
+        }
+        await websocket.send(json.dumps(response))
+
+    async def _handle_create_pair_code(self, message: Dict[str, Any], websocket: WebSocketServerProtocol):
+        meta = await self._require_registered(websocket, allowed_roles={"openclaw"})
+        if not meta:
+            return
+
+        requested_server = self._normalize_identity(message.get("server_id"))
+        server_id = requested_server or meta.get("server_id", "")
+        if not server_id:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": "Missing required field: server_id",
+                    }
+                )
+            )
+            return
+
+        ttl_seconds = 120
+        raw_ttl = message.get("ttl_seconds")
+        if isinstance(raw_ttl, (int, float)):
+            ttl_seconds = int(raw_ttl)
+
+        try:
+            issued = self._create_pair_code(server_id=server_id, ttl_seconds=ttl_seconds)
+        except RuntimeError as e:
+            await websocket.send(json.dumps({"type": "error", "error": str(e)}))
+            return
+
+        response = {
+            "type": "pair_code_created",
+            "status": "success",
+            "pair_code": issued["pair_code"],
+            "server_id": issued["server_id"],
+            "expires_at": issued["expires_at"],
+            "ttl_seconds": ttl_seconds,
+            "timestamp": datetime.now().isoformat(),
+        }
+        await websocket.send(json.dumps(response))
+
+    async def _handle_pair_with_code(self, message: Dict[str, Any], websocket: WebSocketServerProtocol):
+        pair_code = self._normalize_identity(message.get("pair_code"))
+        nickname = self._normalize_identity(message.get("nickname")) or "Mobile User"
+        device_id = self._normalize_identity(message.get("device_id"))
+
+        if not pair_code:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": "Missing required field: pair_code",
+                    }
+                )
+            )
+            return
+
+        self._purge_expired_pair_codes()
+        pair_meta = self.pair_codes.get(pair_code)
+        if not pair_meta:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "pair_with_code_response",
+                        "status": "error",
+                        "error": "Pair code is invalid or expired",
+                    }
+                )
+            )
+            return
+
+        server_id = str(pair_meta.get("server_id", "")).strip()
+        if not server_id:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "pair_with_code_response",
+                        "status": "error",
+                        "error": "Pair code is missing server information",
+                    }
+                )
+            )
+            return
+
+        account_id = f"acct_{uuid.uuid4().hex[:10]}"
+        pair_token = uuid.uuid4().hex
+        self.pair_tokens[pair_token] = {
+            "server_id": server_id,
+            "account_id": account_id,
+            "device_id": device_id,
+        }
+
+        self.users[account_id] = VirtualPlatformUser(account_id, nickname)
+        # One-time code: consume only after successful credential issuance.
+        self.pair_codes.pop(pair_code, None)
+
+        response = {
+            "type": "pair_with_code_response",
+            "status": "success",
+            "server_id": server_id,
+            "account_id": account_id,
+            "user_id": account_id,
+            "pair_token": pair_token,
+            "ws_url": self._resolve_ws_url(websocket),
+            "nickname": nickname,
             "timestamp": datetime.now().isoformat(),
         }
         await websocket.send(json.dumps(response))
@@ -448,6 +672,12 @@ class VirtualPlatformServer:
             # 测试连接
             response = {"type": "pong", "timestamp": datetime.now().isoformat()}
             await websocket.send(json.dumps(response))
+
+        elif msg_type == "create_pair_code":
+            await self._handle_create_pair_code(message, websocket)
+
+        elif msg_type == "pair_with_code":
+            await self._handle_pair_with_code(message, websocket)
 
         elif msg_type == "simulate_user_message":
             if not await self._require_registered(websocket, allowed_roles={"client"}):
